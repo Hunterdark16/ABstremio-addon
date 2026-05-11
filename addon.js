@@ -465,6 +465,30 @@ const fallbackTitle = isWatchId
   return results.slice(0, CATALOG_ITEM_LIMIT);
 }
 
+function debugCatalogHtml(html, baseUrl) {
+  const $ = cheerio.load(html);
+
+  const hrefs = $("a[href]")
+    .map((_, el) => $(el).attr("href"))
+    .get()
+    .filter(Boolean);
+
+  const watchHrefs = hrefs.filter(h => /\/watch\/\d+/i.test(h));
+
+  const scripts = $("script[src]")
+    .map((_, el) => absoluteUrl($(el).attr("src"), baseUrl))
+    .get()
+    .filter(Boolean);
+
+  console.log(`[debug] html length=${html.length}`);
+  console.log(`[debug] total hrefs=${hrefs.length}`);
+  console.log(`[debug] watch hrefs=${watchHrefs.length}: ${watchHrefs.slice(0, 10).join(", ") || "(none)"}`);
+  console.log(`[debug] script srcs=${scripts.length}: ${scripts.slice(0, 10).join(", ") || "(none)"}`);
+
+  const apiLike = html.match(/["'`](\/[^"'`]*(?:api|video|watch|recent|search)[^"'`]*)["'`]/gi) || [];
+  console.log(`[debug] api-like strings=${apiLike.length}: ${apiLike.slice(0, 20).join(" | ") || "(none)"}`);
+}
+
 async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
   const page = Math.floor((Number(skip) || 0) / CATALOG_ITEM_LIMIT) + 1;
 
@@ -532,7 +556,8 @@ async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
 
   try {
     const html = await fetchHtml(catalogUrl);
-    const metas = extractPostCards(html, catalogUrl);
+debugCatalogHtml(html, catalogUrl);
+const metas = extractPostCards(html, catalogUrl);
 
     if (metas.length > 0) {
       return metas;
