@@ -43,6 +43,12 @@ const DEBUG_STREAM_SNIPPETS = process.env.DEBUG_STREAM_SNIPPETS === "1";
 // If /proxy is used manually, do not send video bytes through the outbound proxy.
 const SEGMENT_RE = /\.(ts|aac|m4s|woff2)(\?|$)/i;
 
+const ID_PREFIX = "ab:"; // change per addon: "pb:", "cb:", etc.
+
+function ownsId(id) {
+  return typeof id === "string" && id.startsWith(ID_PREFIX);
+}
+
 async function doFetch(url, opts = {}, useProxy = true) {
   const options = { redirect: "follow", ...opts };
   if (useProxy && proxyAgent) options.agent = proxyAgent;
@@ -1787,7 +1793,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 });
 
 builder.defineMetaHandler(async ({ type, id }) => {
-  if (type !== "movie") return { meta: null };
+  if (type !== "movie" || !ownsId(id)) return { meta: null };
 
   try {
     const cached = metaCache.get(id);
@@ -1834,8 +1840,8 @@ function buildExternalStreamObjects(externalPlayerUrls, pageUrl) {
 
     streams.push({
       name: "Archivebate 🔗",
-      title: item.label ? `${item.label} (${host})` : host,
-      externalUrl: item.url,
+      title: "Open Mixdrop Player"
+externalUrl: item.url
     });
   }
 
@@ -1875,7 +1881,7 @@ function buildStreamObjects(videoUrls) {
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  if (type !== "movie") return { streams: [] };
+  if (type !== "movie" || !ownsId(id)) return { streams: [] };
 
   const pageUrl = absoluteUrl(`/${decodeId(id)}/`);
 
