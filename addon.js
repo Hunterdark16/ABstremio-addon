@@ -147,20 +147,26 @@ function startStreamPrewarm(id, snapshot = null) {
   const runPrewarm = async () => {
     // Best path: reuse the HTML already fetched by metadata.
     if (snapshot && snapshot.html && snapshot.pageUrl) {
-      const videoUrls = await resolveVideoUrlsFromHtml(
-        snapshot.html,
-        snapshot.pageUrl,
-        snapshot.videoId,
-        snapshot.cookieStr || ""
-      );
+  const videoUrls = await resolveVideoUrlsFromHtml(
+    snapshot.html,
+    snapshot.pageUrl,
+    snapshot.videoId,
+    snapshot.cookieStr || ""
+  );
 
-      const result = {
-        meta: snapshot.meta || null,
-        videoUrl: videoUrls[0] || null,
-        videoUrls,
-        cookieStr: snapshot.cookieStr || "",
-        updatedAt: Date.now(),
-      };
+  const externalPlayerUrls = extractExternalPlayerUrlsFromHtml(
+    snapshot.html,
+    snapshot.pageUrl
+  );
+
+  const result = {
+    meta: snapshot.meta || null,
+    videoUrl: videoUrls[0] || null,
+    videoUrls,
+    externalPlayerUrls,
+    cookieStr: snapshot.cookieStr || "",
+    updatedAt: Date.now(),
+  };
 
       metaCache.set(id, result);
       return result;
@@ -1603,6 +1609,48 @@ function debugCandidateScan(html, videoId) {
   );
 }
 
+function extractExternalPlayerUrlsFromHtml(html, pageUrl) {
+  const $ = cheerio.load(html);
+  const urls = [];
+  const seen = new Set();
+
+  const add = (raw, label = "external") => {
+    const abs = absoluteUrl(raw, pageUrl);
+    if (!abs) return;
+
+    // External embedded players found on Archivebate watch pages.
+    if (!/(mixdrop|streamtape|dood|voe|filemoon|vidhide|streamwish|player|embed)/i.test(abs)) {
+      return;
+    }
+
+    if (seen.has(abs)) return;
+    seen.add(abs);
+
+    urls.push({
+      url: abs,
+      label,
+    });
+  };
+
+  $("iframe[src]").each((_, el) => {
+    add($(el).attr("src"), "Embedded Player");
+  });
+
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (/(mixdrop|streamtape|dood|voe|filemoon|vidhide|streamwish)/i.test(href || "")) {
+      add(href, "External Player");
+    }
+  });
+
+  console.log(
+    `[external] found ${urls.length} external player URL(s): ` +
+    `${urls.map(x => redactSensitive(x.url)).join(" | ") || "(none)"}`
+  );
+
+  return urls;
+}
+
 async function scrapeMetaById(id, options = {}) {
   const resolveStreams = options.resolveStreams === true;
   const slug = decodeId(id);
@@ -1645,6 +1693,7 @@ async function scrapeMetaById(id, options = {}) {
 
   const videoId = extractVideoIdFromHtml(html);
   console.log(`[meta] videoId=${videoId || "unknown"}`);
+  const externalPlayerUrls = extractExternalPlayerUrlsFromHtml(html, pageUrl);
 
   const meta = {
     id,
@@ -1662,45 +1711,48 @@ async function scrapeMetaById(id, options = {}) {
     console.log(`[meta] metadata-only request; stream resolving skipped`);
 
     metaCache.set(id, {
-      meta,
-      videoUrl: null,
-      videoUrls: [],
-      cookieStr,
-      updatedAt: Date.now(),
-    });
+  meta,
+  videoUrl: null,
+  videoUrls: [],
+  externalPlayerUrls,
+  cookieStr,
+  updatedAt: Date.now(),
+});
 
     // Return the fetched HTML too, so prewarm can reuse it instead of fetching
     // the same page again through the outbound proxy.
     return {
-      meta,
-      videoUrl: null,
-      videoUrls: [],
-      cookieStr,
-      html,
-      pageUrl,
-      videoId,
-    };
+  meta,
+  videoUrl: null,
+  videoUrls: [],
+  externalPlayerUrls,
+  cookieStr,
+  html,
+  pageUrl,
+  videoId,
+};
   }
 
   const videoUrls = await resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr);
   const videoUrl = videoUrls[0] || null;
 
   const result = {
-    meta,
-    videoUrl,
-    videoUrls,
-    cookieStr,
-    updatedAt: Date.now(),
-  };
+  meta,
+  videoUrl,
+  videoUrls,
+  externalPlayerUrls,
+  cookieStr,
+  updatedAt: Date.now(),
+};
 
   metaCache.set(id, result);
 
   return {
-    ...result,
-    html,
-    pageUrl,
-    videoId,
-  };
+  ...result,
+  html,
+  pageUrl,
+  videoId,
+};
 }
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
@@ -1768,6 +1820,37 @@ builder.defineMetaHandler(async ({ type, id }) => {
   }
 });
 
+function buildExternalStreamObjects(externalPlayerUrls, pageUrl) {
+  const streams = [];
+
+  for (const item of externalPlayerUrls || []) {
+    const host = (() => {
+      try {
+        return new URL(item.url).hostname.replace(/^www\./, "");
+      } catch {
+        return "External";
+      }
+    })();
+
+    streams.push({
+      name: "Archivebate 🔗",
+      title: item.label ? `${item.label} (${host})` : host,
+      externalUrl: item.url,
+    });
+  }
+
+  // Keep the source page as fallback.
+  if (pageUrl) {
+    streams.push({
+      name: "Archivebate 🔗",
+      title: "Open Page",
+      externalUrl: pageUrl,
+    });
+  }
+
+  return streams;
+}
+
 function buildStreamObjects(videoUrls) {
   const qualityLabels = {
     "_1080p": "1080p",
@@ -1799,22 +1882,27 @@ builder.defineStreamHandler(async ({ type, id }) => {
   try {
     const cached = metaCache.get(id);
 
-    if (
-      cached &&
-      cached.videoUrls &&
-      cached.videoUrls.length > 0 &&
-      Date.now() - cached.updatedAt < STREAM_CACHE_MS
-    ) {
-      console.log(`[stream] short cache hit for ${id}`);
+    if (cached && Date.now() - cached.updatedAt < STREAM_CACHE_MS) {
+  if (cached.videoUrls && cached.videoUrls.length > 0) {
+    console.log(`[stream] short cache hit for direct URLs ${id}`);
 
-      const streams = buildStreamObjects(
-        cached.videoUrls,
-        pageUrl,
-        cached.cookieStr || ""
-      );
+    const streams = buildStreamObjects(
+      cached.videoUrls,
+      pageUrl,
+      cached.cookieStr || ""
+    );
 
-      return { streams };
-    }
+    return { streams };
+  }
+
+  if (cached.externalPlayerUrls && cached.externalPlayerUrls.length > 0) {
+    console.log(`[stream] short cache hit for external players ${id}`);
+
+    return {
+      streams: buildExternalStreamObjects(cached.externalPlayerUrls, pageUrl),
+    };
+  }
+}
 
     const prewarmPromise = streamPrewarmPromises.get(id);
 
@@ -1824,39 +1912,55 @@ builder.defineStreamHandler(async ({ type, id }) => {
       const prewarmed = await prewarmPromise;
 
       if (prewarmed && prewarmed.videoUrls && prewarmed.videoUrls.length > 0) {
-        console.log(`[stream] using prewarmed streams for ${id}`);
+  console.log(`[stream] using prewarmed direct streams for ${id}`);
 
-        const streams = buildStreamObjects(
-          prewarmed.videoUrls,
-          pageUrl,
-          prewarmed.cookieStr || ""
-        );
+  const streams = buildStreamObjects(
+    prewarmed.videoUrls,
+    pageUrl,
+    prewarmed.cookieStr || ""
+  );
 
-        return { streams };
-      }
+  return { streams };
+}
 
-      console.log(`[stream] prewarm finished without usable streams for ${id}`);
+if (prewarmed && prewarmed.externalPlayerUrls && prewarmed.externalPlayerUrls.length > 0) {
+  console.log(`[stream] using prewarmed external players for ${id}`);
+
+  return {
+    streams: buildExternalStreamObjects(prewarmed.externalPlayerUrls, pageUrl),
+  };
+}
+
+console.log(`[stream] prewarm finished without usable streams for ${id}`);
     }
 
     console.log(`[stream] fresh scrape for ${id}`);
 
-    const { videoUrls, cookieStr } = await scrapeMetaById(id, {
-      resolveStreams: true,
-    });
+    const { videoUrls, externalPlayerUrls, cookieStr } = await scrapeMetaById(id, {
+  resolveStreams: true,
+});
 
-    if (!videoUrls || videoUrls.length === 0) {
-      console.log(`[stream] no playable URLs found`);
+    if ((!videoUrls || videoUrls.length === 0) && externalPlayerUrls && externalPlayerUrls.length > 0) {
+  console.log(`[stream] no direct URLs found; returning ${externalPlayerUrls.length} external player(s)`);
 
-      return {
-        streams: [
-          {
-            name: "Archivebate 🔗",
-            title: "Open Page",
-            externalUrl: pageUrl,
-          },
-        ],
-      };
-    }
+  return {
+    streams: buildExternalStreamObjects(externalPlayerUrls, pageUrl),
+  };
+}
+
+if (!videoUrls || videoUrls.length === 0) {
+  console.log(`[stream] no playable URLs or external players found`);
+
+  return {
+    streams: [
+      {
+        name: "Archivebate 🔗",
+        title: "Open Page",
+        externalUrl: pageUrl,
+      },
+    ],
+  };
+}
 
     const streams = buildStreamObjects(videoUrls, pageUrl, cookieStr || "");
 
