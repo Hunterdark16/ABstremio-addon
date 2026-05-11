@@ -43,20 +43,20 @@ async function doFetch(url, opts = {}, useProxy = true) {
 
 // Archivebate category/tag slugs — update these to match the site's actual tag URLs
 const GENRE_TAG_SLUGS = {
-  "YouTube": "eW91dHViZQ%3D%3D",
-  "Twitch": "dHdpdGNo",
-  "OnlyFans": "b25seWZhbnM%3D",
-  "Instagram": "aW5zdGFncmFt",
-  "TikTok": "dGlrdG9r",
-  "Bongacams": "Ym9uZ2FjYW1z",
-  "Cam4": "Y2FtNA%3D%3D",
-  "Camsoda": "Y2Ftc29kYQ%3D%3D",
-  "Chaturbate": "Y2hhdHVyYmF0ZQ%3D%3D",
-  "Stripchat": "c3RyaXBjaGF0",
-  "Female": "ZmVtYWxl",
-  "Couple": "Y291cGxl",
-  "Male": "bWFsZQ%3D%3D",
-  "Trans": "dHJhbnM%3D",
+  "YouTube": "platform/eW91dHViZQ==",
+  "Twitch": "platform/dHdpdGNo",
+  "OnlyFans": "platform/b25seWZhbnM=",
+  "Instagram": "platform/aW5zdGFncmFt",
+  "TikTok": "platform/dGlrdG9r",
+  "Bongacams": "platform/Ym9uZ2FjYW1z",
+  "Cam4": "platform/Y2FtNA==",
+  "Camsoda": "platform/Y2Ftc29kYQ==",
+  "Chaturbate": "platform/Y2hhdHVyYmF0ZQ==",
+  "Stripchat": "platform/c3RyaXBjaGF0",
+  "Female": "gender/ZmVtYWxl",
+  "Couple": "gender/Y291cGxl",
+  "Male": "gender/bWFsZQ==",
+  "Trans": "gender/dHJhbnM=",
 };
 
 const manifest = {
@@ -227,6 +227,180 @@ async function fetchHtml(url, extraHeaders = {}) {
   return await res.text();
 }
 
+async function fetchHtmlWithCookies(url, extraHeaders = {}) {
+  console.log(`[fetchHtml] GET ${url} (proxy=${!!proxyAgent})`);
+
+  const res = await doFetch(
+    url,
+    {
+      headers: { ...HEADERS, ...extraHeaders },
+    },
+    true
+  );
+
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+
+  const html = await res.text();
+  const cookieStr = getSetCookiePairs(res);
+
+  return { html, cookieStr };
+}
+
+function decodeHtmlAttr(value) {
+  return String(value || "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&#039;/g, "'")
+    .replace(/&#39;/g, "'");
+}
+
+function extractCsrfToken(html) {
+  const $ = cheerio.load(html);
+
+  return (
+    $("meta[name='csrf-token']").attr("content") ||
+    $("input[name='_token']").attr("value") ||
+    (() => {
+      const m =
+        html.match(/csrfToken["']?\s*[:=]\s*["']([^"']+)/i) ||
+        html.match(/csrf-token["']?\s*content=["']([^"']+)/i) ||
+        html.match(/window\.livewire_token\s*=\s*["']([^"']+)/i);
+      return m?.[1] || "";
+    })()
+  );
+}
+
+function extractLivewireInitialData(html) {
+  const $ = cheerio.load(html);
+
+  const node = $("[wire\\:initial-data][wire\\:init]").first();
+  if (!node.length) {
+    console.log("[livewire] no wire:initial-data node found");
+    return null;
+  }
+
+  const initMethod = node.attr("wire:init") || "loadVideos";
+  const rawInitialData = decodeHtmlAttr(node.attr("wire:initial-data"));
+
+  try {
+    const initialData = JSON.parse(rawInitialData);
+
+    console.log(
+      `[livewire] found component name=${initialData?.fingerprint?.name || "(unknown)"} ` +
+      `id=${initialData?.fingerprint?.id || "(unknown)"} init=${initMethod}`
+    );
+
+    return { initialData, initMethod };
+  } catch (err) {
+    console.warn(`[livewire] failed to parse wire:initial-data: ${err.message}`);
+    console.warn(`[livewire] raw initial data sample: ${rawInitialData.substring(0, 500)}`);
+    return null;
+  }
+}
+
+async function fetchLivewireInitializedHtml(pageHtml, pageUrl, cookieStr = "") {
+  const extracted = extractLivewireInitialData(pageHtml);
+  if (!extracted) return "";
+
+  const { initialData, initMethod } = extracted;
+  const componentName = initialData?.fingerprint?.name;
+  const componentId = initialData?.fingerprint?.id;
+
+  if (!componentName || !componentId) {
+    console.warn("[livewire] missing component name/id");
+    return "";
+  }
+
+  const csrfToken = extractCsrfToken(pageHtml);
+
+  console.log(`[livewire] csrf=${csrfToken ? "found" : "missing"}`);
+
+  const endpoint = `${BASE_URL}/livewire/message/${componentName}`;
+
+  const payload = {
+    fingerprint: initialData.fingerprint,
+    serverMemo: initialData.serverMemo,
+    updates: [
+      {
+        type: "callMethod",
+        payload: {
+          id: componentId,
+          method: initMethod,
+          params: [],
+        },
+      },
+    ],
+  };
+
+  console.log(`[livewire] POST ${endpoint} method=${initMethod}`);
+
+  const res = await doFetch(
+    endpoint,
+    {
+      method: "POST",
+      headers: {
+        ...HEADERS,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "X-Livewire": "true",
+        "Referer": pageUrl,
+        "Origin": BASE_URL,
+        ...(csrfToken ? { "X-CSRF-TOKEN": csrfToken } : {}),
+        ...(cookieStr ? { Cookie: cookieStr } : {}),
+      },
+      body: JSON.stringify(payload),
+    },
+    true
+  );
+
+  const text = await res.text();
+
+  console.log(`[livewire] status=${res.status} bodyLen=${text.length}`);
+
+  if (!res.ok) {
+    console.warn(`[livewire] failed body sample: ${text.substring(0, 1000)}`);
+    return "";
+  }
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (err) {
+    console.warn(`[livewire] JSON parse failed: ${err.message}`);
+    console.warn(`[livewire] body sample: ${text.substring(0, 1000)}`);
+    return "";
+  }
+
+  const hydratedHtml = json?.effects?.html || "";
+  console.log(`[livewire] hydrated html length=${hydratedHtml.length}`);
+
+  return hydratedHtml;
+}
+
+async function fetchCatalogMetasFromLivewirePage(url) {
+  const { html, cookieStr } = await fetchHtmlWithCookies(url);
+
+  debugCatalogHtml(html, url);
+
+  let metas = extractPostCards(html, url);
+  if (metas.length > 0) return metas;
+
+  console.log("[catalog] no static watch links; trying Livewire hydration");
+
+  const hydratedHtml = await fetchLivewireInitializedHtml(html, url, cookieStr);
+
+  if (hydratedHtml) {
+    metas = extractPostCards(hydratedHtml, url);
+
+    console.log(`[catalog] Livewire extractPostCards found ${metas.length} video items`);
+
+    if (metas.length > 0) return metas;
+  }
+
+  return [];
+}
+
 function cleanSlugPath(value) {
   return String(value || "")
     .replace(/^\/+|\/+$/g, "")
@@ -309,13 +483,10 @@ function isRealVideoPath(pathname) {
   const prefix = segments[0].toLowerCase();
   const value = segments[1];
 
-  // Archivebate real video pages:
-  // /watch/16344057
   if (prefix === "watch") {
     return /^\d{4,}$/.test(value);
   }
 
-  // Keep optional compatibility with slug-style paths in case the site exposes them somewhere.
   if (["videos", "video"].includes(prefix)) {
     if (!value) return false;
     if (/^\d+$/.test(value)) return false;
@@ -546,51 +717,46 @@ async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
   }
 
   if (genre && GENRE_TAG_SLUGS[genre]) {
-  const encodedPlatform = GENRE_TAG_SLUGS[genre];
+  const route = GENRE_TAG_SLUGS[genre];
 
-  const platformUrl = page <= 1
-    ? `${BASE_URL}/platform/${encodedPlatform}`
-    : `${BASE_URL}/platform/${encodedPlatform}?page=${page}`;
+  const genreUrl = page <= 1
+    ? `${BASE_URL}/${route}`
+    : `${BASE_URL}/${route}?page=${page}`;
 
   try {
-    console.log(`[catalog] fetching genre "${genre}" from ${platformUrl}`);
+    console.log(`[catalog] fetching genre "${genre}" from ${genreUrl}`);
 
-    const html = await fetchHtml(platformUrl);
-    debugCatalogHtml(html, platformUrl);
-
-    const metas = extractPostCards(html, platformUrl);
+    const metas = await fetchCatalogMetasFromLivewirePage(genreUrl);
 
     if (metas.length > 0) {
       return metas;
     }
 
-    console.warn(`[catalog] genre "${genre}" had no server-rendered watch links from ${platformUrl}`);
+    console.warn(`[catalog] genre "${genre}" returned no video metas from ${genreUrl}`);
     return [];
   } catch (err) {
-    console.warn(`[catalog] genre "${genre}" fetch failed: ${platformUrl} -> ${err.message}`);
+    console.warn(`[catalog] genre "${genre}" fetch failed: ${genreUrl} -> ${err.message}`);
     return [];
   }
 }
 
   // Archivebate main catalog pagination: /?page=2, /?page=3, etc.
   const catalogUrl = page <= 1
-    ? `${BASE_URL}/`
-    : `${BASE_URL}/?page=${page}`;
+  ? `${BASE_URL}/`
+  : `${BASE_URL}/?page=${page}`;
 
-  try {
-    const html = await fetchHtml(catalogUrl);
-debugCatalogHtml(html, catalogUrl);
-const metas = extractPostCards(html, catalogUrl);
+try {
+  const metas = await fetchCatalogMetasFromLivewirePage(catalogUrl);
 
-    if (metas.length > 0) {
-      return metas;
-    }
-
-    throw new Error(`No metas found on ${catalogUrl}`);
-  } catch (err) {
-    console.warn(`Catalog fetch failed: ${catalogUrl} -> ${err.message}`);
-    throw err;
+  if (metas.length > 0) {
+    return metas;
   }
+
+  throw new Error(`No metas found on ${catalogUrl}`);
+} catch (err) {
+  console.warn(`Catalog fetch failed: ${catalogUrl} -> ${err.message}`);
+  throw err;
+}
 }
 
 function extractVideoIdFromHtml(html) {
