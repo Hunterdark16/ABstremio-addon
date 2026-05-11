@@ -499,6 +499,150 @@ function isRealVideoPath(pathname) {
   return false;
 }
 
+function firstSrcsetUrl(srcset) {
+  if (!srcset) return null;
+
+  return String(srcset)
+    .split(",")
+    .map(x => x.trim().split(/\s+/)[0])
+    .find(Boolean) || null;
+}
+
+function extractCssUrl(style) {
+  if (!style) return null;
+
+  const m = String(style).match(/url\((['"]?)(.*?)\1\)/i);
+  return m?.[2] || null;
+}
+
+function isUsablePosterUrl(url) {
+  if (!url) return false;
+
+  const s = String(url);
+
+  if (/^data:/i.test(s)) return false;
+  if (/\.(mp4|webm|m3u8)(?:[?#]|$)/i.test(s)) return false;
+  if (/(placeholder|avatar|logo|icon|blank|spacer|pixel)/i.test(s)) return false;
+
+  return true;
+}
+
+function collectImageCandidatesFromNode($, node, baseUrl) {
+  const out = [];
+  const add = value => {
+    const abs = absoluteUrl(value, baseUrl);
+    if (abs && isUsablePosterUrl(abs)) out.push(abs);
+  };
+
+  const attrs = [
+    "data-src",
+    "data-lazy-src",
+    "data-original",
+    "data-thumb",
+    "data-thumbnail",
+    "data-image",
+    "data-bg",
+    "data-background",
+    "poster",
+    "src",
+  ];
+
+  for (const attr of attrs) {
+    add(node.attr(attr));
+  }
+
+  add(firstSrcsetUrl(node.attr("data-srcset")));
+  add(firstSrcsetUrl(node.attr("srcset")));
+  add(extractCssUrl(node.attr("style")));
+
+  return out;
+}
+
+function findPosterImage($, scope, baseUrl) {
+  const candidates = [];
+
+  const addMany = arr => {
+    for (const item of arr) {
+      if (item && !candidates.includes(item)) candidates.push(item);
+    }
+  };
+
+  // Check the scope itself first.
+  scope.each((_, el) => {
+    addMany(collectImageCandidatesFromNode($, $(el), baseUrl));
+  });
+
+  // Then check common image/lazy/background nodes inside it.
+  scope
+    .find(
+      [
+        "img",
+        "picture source",
+        "video",
+        "[style]",
+        "[data-src]",
+        "[data-lazy-src]",
+        "[data-original]",
+        "[data-thumb]",
+        "[data-thumbnail]",
+        "[data-image]",
+        "[data-bg]",
+        "[data-background]",
+        "[poster]",
+      ].join(", ")
+    )
+    .each((_, el) => {
+      addMany(collectImageCandidatesFromNode($, $(el), baseUrl));
+    });
+
+  return candidates[0] || null;
+}
+
+function isBadCatalogTitle(title) {
+  const t = cleanCatalogText(title);
+
+  if (!t) return true;
+  if (t.length < 3) return true;
+  if (/^\d+$/.test(t)) return true;
+  if (BAD_CATALOG_TITLE_RE.test(t)) return true;
+  if (/^(watch|view|play|loading|recent videos|recently uploaded)$/i.test(t)) return true;
+  if (/^#/.test(t)) return true;
+
+  return false;
+}
+
+function pickCatalogTitle(candidates, fallbackTitle) {
+  const cleaned = [];
+
+  for (const candidate of candidates) {
+    const t = cleanCatalogText(candidate)
+      .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (isBadCatalogTitle(t)) continue;
+    if (!cleaned.includes(t)) cleaned.push(t);
+  }
+
+  if (cleaned.length === 0) return fallbackTitle;
+
+  cleaned.sort((a, b) => {
+    const aScore =
+      Math.min(a.length, 120) +
+      (a.includes(" ") ? 20 : 0) -
+      (/^archivebate video \d+$/i.test(a) ? 100 : 0);
+
+    const bScore =
+      Math.min(b.length, 120) +
+      (b.includes(" ") ? 20 : 0) -
+      (/^archivebate video \d+$/i.test(b) ? 100 : 0);
+
+    return bScore - aScore;
+  });
+
+  return cleaned[0].substring(0, 180);
+}
+
 function extractPostCards(html, baseUrl) {
   const $ = cheerio.load(html);
   const siteBase = baseUrl || BASE_URL;
@@ -514,101 +658,100 @@ function extractPostCards(html, baseUrl) {
   const results = [];
   const seenVideoPaths = new Set();
 
-  $("a[href]").each((_, el) => {
-    const a = $(el);
-    const rawHref = a.attr("href");
-    if (!rawHref) return;
+  function parseUrlFromHref(rawHref) {
+    if (!rawHref) return null;
 
-    let u;
     try {
-      u = new URL(rawHref, siteBase);
+      const u = new URL(rawHref, siteBase);
+      if (u.hostname !== siteHostname) return null;
+      if (!isRealVideoPath(u.pathname)) return null;
+      return u;
     } catch {
-      return;
+      return null;
     }
+  }
 
-    if (u.hostname !== siteHostname) return;
-    if (!isRealVideoPath(u.pathname)) return;
+  function addCard(container, primaryLink) {
+    const href = primaryLink.attr("href");
+    const u = parseUrlFromHref(href);
+    if (!u) return;
 
     const pathKey = cleanSlugPath(u.pathname);
     if (seenVideoPaths.has(pathKey)) return;
-    seenVideoPaths.add(pathKey);
 
     const slug = pathKey.split("/").pop();
-const isWatchId = /^watch\/\d+$/i.test(pathKey);
-const fallbackTitle = isWatchId
-  ? `Archivebate Video ${slug}`
-  : titleFromVideoSlug(slug);
+    const isWatchId = /^watch\/\d+$/i.test(pathKey);
+    const fallbackTitle = isWatchId
+      ? `Archivebate Video ${slug}`
+      : titleFromVideoSlug(slug);
 
-    const closestCard = a.closest(
-      "article, .video, .video-item, .thumb, .thumbnail, .item, .card, .post, [class*='video'], [class*='thumb']"
-    );
-
-    const container = closestCard.length ? closestCard : a;
+    // Important: collect all links in the same card pointing to the same watch URL.
+    // Archivebate often has one link around the thumbnail and another around the title.
+    const samePathLinks = container.find("a[href]").filter((_, el) => {
+      const candidateUrl = parseUrlFromHref($(el).attr("href"));
+      return candidateUrl && cleanSlugPath(candidateUrl.pathname) === pathKey;
+    });
 
     const imgNode =
-      a.find("img").first().length
-        ? a.find("img").first()
+      samePathLinks.find("img").first().length
+        ? samePathLinks.find("img").first()
         : container.find("img").first();
 
-    const rawTitleCandidates = [
-      a.attr("title"),
+    const titleCandidates = [
+      container.attr("data-title"),
+      container.attr("aria-label"),
+      primaryLink.attr("title"),
+      primaryLink.attr("aria-label"),
       imgNode.attr("alt"),
       imgNode.attr("title"),
-      a.find("[class*='title'], [class*='name']").first().text(),
-      container.find("[class*='title']").first().text(),
-      a.text(),
+
+      ...samePathLinks
+        .map((_, el) => $(el).attr("title"))
+        .get(),
+
+      ...samePathLinks
+        .map((_, el) => $(el).attr("aria-label"))
+        .get(),
+
+      ...samePathLinks
+        .map((_, el) => $(el).text())
+        .get(),
+
+      ...container
+        .find(
+          [
+            ".title",
+            ".video-title",
+            ".name",
+            ".video-name",
+            ".username",
+            "[class*='title']",
+            "[class*='name']",
+            "[itemprop='name']",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+          ].join(", ")
+        )
+        .map((_, el) => $(el).text())
+        .get(),
+
       fallbackTitle,
     ];
 
-    let title = "";
+    const title = pickCatalogTitle(titleCandidates, fallbackTitle);
 
-    for (const candidate of rawTitleCandidates) {
-      const cleaned = cleanCatalogText(candidate);
-      if (!cleaned) continue;
-      if (cleaned.length < 3) continue;
-      if (BAD_CATALOG_TITLE_RE.test(cleaned)) continue;
+    const rawImg =
+      findPosterImage($, samePathLinks, siteBase) ||
+      findPosterImage($, primaryLink, siteBase) ||
+      findPosterImage($, container, siteBase);
 
-      title = cleaned;
-      break;
-    }
-
-    if (!title) {
-      title = titleFromVideoSlug(slug);
-    }
-
-    if (!title || BAD_CATALOG_TITLE_RE.test(title)) return;
-
-    const rawImg = absoluteUrl(
-      imgNode.attr("data-src") ||
-      imgNode.attr("data-lazy-src") ||
-      imgNode.attr("data-original") ||
-      imgNode.attr("data-thumb") ||
-      (() => {
-        const ss = imgNode.attr("srcset");
-        if (!ss) return null;
-
-        const first = ss
-          .split(",")
-          .map(x => x.trim().split(/\s+/)[0])
-          .find(Boolean);
-
-        return first || null;
-      })() ||
-      imgNode.attr("src"),
-      siteBase
-    );
-
-    const imgOk =
-      rawImg &&
-      !/(placeholder|avatar|logo|icon|blank|spacer|pixel|\.gif)/i.test(rawImg);
-
-    const img = imgOk
-  ? (
-      PROXY_IMAGES && PUBLIC_BASE_URL
+    const img =
+      rawImg && PROXY_IMAGES && PUBLIC_BASE_URL
         ? `${PUBLIC_BASE_URL}/imgproxy?url=${encodeURIComponent(rawImg)}`
-        : rawImg
-    )
-  : undefined;
+        : rawImg || undefined;
 
     const description = cleanCatalogText(
       container
@@ -621,6 +764,8 @@ const fallbackTitle = isWatchId
       container.find("time").attr("datetime") ||
       cleanCatalogText(container.find("[class*='date'], [class*='time']").first().text());
 
+    seenVideoPaths.add(pathKey);
+
     results.push({
       id: makeIdFromPath(pathKey),
       type: "movie",
@@ -631,6 +776,71 @@ const fallbackTitle = isWatchId
       description: [date, description].filter(Boolean).join(" • "),
       website: u.toString(),
     });
+
+    if (process.env.DEBUG_CATALOG_ITEMS === "1" && results.length <= 5) {
+      console.log(
+        `[catalog-debug] item ${results.length}: id=${makeIdFromPath(pathKey)} title="${title}" img=${img || "(none)"}`
+      );
+    }
+  }
+
+  // First pass: parse actual card containers.
+  $(
+    [
+      ".video_item",
+      ".video-item",
+      ".video-card",
+      ".video",
+      ".item",
+      ".card",
+      ".thumb",
+      ".thumbnail",
+      "article",
+      "[class*='video_item']",
+      "[class*='video-item']",
+      "[class*='video']",
+      "[class*='thumb']",
+    ].join(", ")
+  ).each((_, el) => {
+    const container = $(el);
+
+    const primaryLink = container.find("a[href]").filter((_, linkEl) => {
+      return !!parseUrlFromHref($(linkEl).attr("href"));
+    }).first();
+
+    if (primaryLink.length) {
+      addCard(container, primaryLink);
+    }
+  });
+
+  // Fallback pass: parse loose anchors that were not inside a matched card.
+  $("a[href]").each((_, el) => {
+    const a = $(el);
+    const u = parseUrlFromHref(a.attr("href"));
+    if (!u) return;
+
+    const pathKey = cleanSlugPath(u.pathname);
+    if (seenVideoPaths.has(pathKey)) return;
+
+    const container = a.closest(
+      [
+        ".video_item",
+        ".video-item",
+        ".video-card",
+        ".video",
+        ".item",
+        ".card",
+        ".thumb",
+        ".thumbnail",
+        "article",
+        "[class*='video_item']",
+        "[class*='video-item']",
+        "[class*='video']",
+        "[class*='thumb']",
+      ].join(", ")
+    );
+
+    addCard(container.length ? container : a, a);
   });
 
   console.log(`[catalog] extractPostCards found ${results.length} video items`);
