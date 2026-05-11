@@ -303,25 +303,28 @@ function isRealVideoPath(pathname) {
   const path = cleanSlugPath(pathname);
   const segments = path.split("/").filter(Boolean);
 
-  // Accept /videos/slug or /video/slug (2 segments)
-  if (segments.length < 1 || segments.length > 2) return false;
-
-  // Single-segment paths are ignored (too ambiguous / likely navigation links)
-  if (segments.length === 1) return false;
+  if (segments.length !== 2) return false;
 
   const prefix = segments[0].toLowerCase();
-  const slug = segments[1];
+  const value = segments[1];
 
-  // Must be under a video-like prefix
-  if (!["videos", "video"].includes(prefix)) return false;
+  // Archivebate real video pages:
+  // /watch/16344057
+  if (prefix === "watch") {
+    return /^\d{4,}$/.test(value);
+  }
 
-  if (!slug) return false;
-  if (/^\d+$/.test(slug)) return false;
-  if (!slug.includes("-")) return false;
-  if (slug.length < 5) return false;
-  if (BAD_CATALOG_SLUG_RE.test(slug)) return false;
+  // Keep optional compatibility with slug-style paths in case the site exposes them somewhere.
+  if (["videos", "video"].includes(prefix)) {
+    if (!value) return false;
+    if (/^\d+$/.test(value)) return false;
+    if (!value.includes("-")) return false;
+    if (value.length < 5) return false;
+    if (BAD_CATALOG_SLUG_RE.test(value)) return false;
+    return true;
+  }
 
-  return true;
+  return false;
 }
 
 function extractPostCards(html, baseUrl) {
@@ -359,6 +362,10 @@ function extractPostCards(html, baseUrl) {
     seenVideoPaths.add(pathKey);
 
     const slug = pathKey.split("/").pop();
+const isWatchId = /^watch\/\d+$/i.test(pathKey);
+const fallbackTitle = isWatchId
+  ? `Archivebate Video ${slug}`
+  : titleFromVideoSlug(slug);
 
     const closestCard = a.closest(
       "article, .video, .video-item, .thumb, .thumbnail, .item, .card, .post, [class*='video'], [class*='thumb']"
@@ -378,7 +385,7 @@ function extractPostCards(html, baseUrl) {
       a.find("[class*='title'], [class*='name']").first().text(),
       container.find("[class*='title']").first().text(),
       a.text(),
-      titleFromVideoSlug(slug),
+      fallbackTitle,
     ];
 
     let title = "";
