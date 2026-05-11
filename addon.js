@@ -37,6 +37,9 @@ const CATALOG_TITLE_CACHE_MS = 6 * 60 * 60 * 1000;
 const ENRICH_CATALOG_TITLES = process.env.ENRICH_CATALOG_TITLES !== "0";
 const MAX_TITLE_ENRICH_CONCURRENCY = Number(process.env.MAX_TITLE_ENRICH_CONCURRENCY || 4);
 
+const DEBUG_STREAM = process.env.DEBUG_STREAM === "1";
+const DEBUG_STREAM_SNIPPETS = process.env.DEBUG_STREAM_SNIPPETS === "1";
+
 // If /proxy is used manually, do not send video bytes through the outbound proxy.
 const SEGMENT_RE = /\.(ts|aac|m4s|woff2)(\?|$)/i;
 
@@ -1308,7 +1311,10 @@ async function resolveGetFileCandidate(candidate, pageUrl, cookieStr, videoId) {
 
   for (const referer of referers) {
     const resolveUrl = addRndParam(candidate.url);
-    console.log(`[resolve] trying ${candidate.quality} ${candidate.hash || "nohash"}: ${resolveUrl} ref=${referer}`);
+    console.log(
+  `[resolve] trying ${candidate.quality} ${candidate.hash || "nohash"}: ` +
+  `${redactSensitive(resolveUrl)} ref=${redactSensitive(referer)}`
+);
 
     let res = null;
     try {
@@ -1337,7 +1343,7 @@ async function resolveGetFileCandidate(candidate, pageUrl, cookieStr, videoId) {
 
       res.body?.destroy?.();
 
-      console.log(`[resolve] status=${status} location=${location || "(none)"}`);
+      console.log(`[resolve] status=${status} location=${location ? redactSensitive(location) : "(none)"}`);
 
       if (location) {
         const resolved = new URL(location, resolveUrl).toString();
@@ -1395,6 +1401,7 @@ function dedupeUrls(urls) {
 }
 
 async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
+	debugCandidateScan(html, videoId);
   const candidates = collectRawGetFileCandidates(html, videoId, "raw-html");
 
   console.log(`[meta] get_file candidates: ${candidates.map(c => `${c.quality}:${c.hash || "nohash"}:${c.source}`).join(", ") || "(none)"}`);
@@ -1423,6 +1430,179 @@ async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
   return finalDeduped;
 }
 
+function redactSensitive(value) {
+  return String(value || "")
+    .replace(/([?&](?:token|hash|sig|signature|expires|time|cv|cv2|cv3|cv4|rnd|key|auth|session|file)=)[^&\s"'<>]+/gi, "$1[redacted]")
+    .replace(/(XSRF-TOKEN=)[^;\s]+/gi, "$1[redacted]")
+    .replace(/(archivebate_session=)[^;\s]+/gi, "$1[redacted]");
+}
+
+function cookieNames(cookieStr) {
+  return String(cookieStr || "")
+    .split(";")
+    .map(x => x.trim().split("=")[0])
+    .filter(Boolean)
+    .join(", ") || "(none)";
+}
+
+function shortText(value, max = 500) {
+  return redactSensitive(
+    String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, max)
+  );
+}
+
+function logMarkerSnippet(label, html, marker) {
+  const idx = html.indexOf(marker);
+  console.log(`[stream-debug] marker "${marker}" idx=${idx}`);
+
+  if (DEBUG_STREAM_SNIPPETS && idx >= 0) {
+    const start = Math.max(0, idx - 500);
+    const end = Math.min(html.length, idx + 1200);
+    console.log(`[stream-debug] snippet around "${marker}": ${shortText(html.slice(start, end), 1800)}`);
+  }
+}
+
+function debugStreamPageHtml(html, pageUrl) {
+  if (!DEBUG_STREAM) return;
+
+  const $ = cheerio.load(html);
+
+  console.log(`[stream-debug] pageUrl=${pageUrl}`);
+  console.log(`[stream-debug] html length=${html.length}`);
+
+  const title =
+    $("meta[property='og:title']").attr("content") ||
+    $("meta[name='twitter:title']").attr("content") ||
+    $("title").first().text() ||
+    $("h1").first().text();
+
+  const ogImage =
+    $("meta[property='og:image']").attr("content") ||
+    $("meta[name='twitter:image']").attr("content") ||
+    "";
+
+  console.log(`[stream-debug] title="${shortText(title, 240)}"`);
+  console.log(`[stream-debug] ogImage=${shortText(ogImage, 300)}`);
+
+  const scripts = $("script[src]")
+    .map((_, el) => absoluteUrl($(el).attr("src"), pageUrl))
+    .get()
+    .filter(Boolean);
+
+  console.log(`[stream-debug] script srcs=${scripts.length}: ${scripts.map(redactSensitive).slice(0, 30).join(" | ") || "(none)"}`);
+
+  const iframes = $("iframe[src]")
+    .map((_, el) => absoluteUrl($(el).attr("src"), pageUrl))
+    .get()
+    .filter(Boolean);
+
+  console.log(`[stream-debug] iframe srcs=${iframes.length}: ${iframes.map(redactSensitive).slice(0, 20).join(" | ") || "(none)"}`);
+
+  const videos = $("video")
+    .map((_, el) => {
+      const node = $(el);
+      return {
+        src: absoluteUrl(node.attr("src"), pageUrl),
+        poster: absoluteUrl(node.attr("poster"), pageUrl),
+        controls: node.attr("controls") != null,
+        class: node.attr("class") || "",
+        id: node.attr("id") || "",
+      };
+    })
+    .get();
+
+  console.log(`[stream-debug] video tags=${videos.length}: ${shortText(JSON.stringify(videos), 1500)}`);
+
+  const sources = $("source[src]")
+    .map((_, el) => ({
+      src: absoluteUrl($(el).attr("src"), pageUrl),
+      type: $(el).attr("type") || "",
+    }))
+    .get();
+
+  console.log(`[stream-debug] source tags=${sources.length}: ${shortText(JSON.stringify(sources), 1500)}`);
+
+  const interestingLinks = $("a[href]")
+    .map((_, el) => absoluteUrl($(el).attr("href"), pageUrl))
+    .get()
+    .filter(Boolean)
+    .filter(u => /(watch|embed|video|stream|download|file|media|mp4|m3u8)/i.test(u));
+
+  console.log(`[stream-debug] interesting hrefs=${interestingLinks.length}: ${interestingLinks.map(redactSensitive).slice(0, 30).join(" | ") || "(none)"}`);
+
+  const livewireNodes = $("[wire\\:id], [wire\\:initial-data], [wire\\:snapshot], [wire\\:effects]");
+  console.log(`[stream-debug] livewire nodes=${livewireNodes.length}`);
+
+  livewireNodes.each((i, el) => {
+    if (i >= 5) return;
+
+    const attrs = el.attribs || {};
+    console.log(`[stream-debug] livewire node ${i} tag=${el.tagName || el.name || "unknown"}`);
+    console.log(`[stream-debug] livewire node ${i} attrs=${shortText(JSON.stringify(attrs), 2000)}`);
+    console.log(`[stream-debug] livewire node ${i} text="${shortText($(el).text(), 500)}"`);
+  });
+
+  const markers = [
+    "/get_file/",
+    "remote_control.php",
+    ".mp4",
+    ".m3u8",
+    "video_url",
+    "video_alt_url",
+    "file:",
+    "sources",
+    "source",
+    "player",
+    "embed",
+    "download",
+    "cdn.freefile.io",
+    "Livewire",
+    "wire:init",
+    "wire:initial-data",
+  ];
+
+  for (const marker of markers) {
+    logMarkerSnippet("stream", html, marker);
+  }
+
+  const mediaLikeStrings =
+    html.match(/https?:\/\/[^"'`\s<>]+(?:mp4|m3u8|get_file|remote_control|embed|stream|download|cdn\.freefile\.io)[^"'`\s<>]*/gi) || [];
+
+  console.log(
+    `[stream-debug] media-like urls=${mediaLikeStrings.length}: ` +
+    `${mediaLikeStrings.map(redactSensitive).slice(0, 20).join(" | ") || "(none)"}`
+  );
+}
+
+function debugCandidateScan(html, videoId) {
+  if (!DEBUG_STREAM) return;
+
+  const normalized = decodeEscapedMediaString(html);
+
+  const counts = {
+    getFile: (normalized.match(/\/get_file\//gi) || []).length,
+    remoteControl: (normalized.match(/remote_control\.php/gi) || []).length,
+    mp4: (normalized.match(/\.mp4/gi) || []).length,
+    m3u8: (normalized.match(/\.m3u8/gi) || []).length,
+    videoUrl: (normalized.match(/video_url/gi) || []).length,
+    videoAltUrl: (normalized.match(/video_alt_url/gi) || []).length,
+    iframe: (normalized.match(/<iframe/gi) || []).length,
+    videoTag: (normalized.match(/<video/gi) || []).length,
+  };
+
+  console.log(`[stream-debug] candidate marker counts=${JSON.stringify(counts)} videoId=${videoId || "unknown"}`);
+
+  const rawMedia = normalized.match(/https?:\/\/[^"'`\s<>]+(?:\.mp4|\.m3u8|get_file|remote_control|embed|stream|download)[^"'`\s<>]*/gi) || [];
+
+  console.log(
+    `[stream-debug] raw media-ish matches=${rawMedia.length}: ` +
+    `${rawMedia.map(redactSensitive).slice(0, 20).join(" | ") || "(none)"}`
+  );
+}
+
 async function scrapeMetaById(id, options = {}) {
   const resolveStreams = options.resolveStreams === true;
   const slug = decodeId(id);
@@ -1440,10 +1620,11 @@ async function scrapeMetaById(id, options = {}) {
   if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status} for ${pageUrl}`);
 
   const html = await pageRes.text();
+  debugStreamPageHtml(html, pageUrl);
   const sessionCookies = getSetCookiePairs(pageRes);
   const cookieStr = mergeCookies(prefCookies, sessionCookies);
 
-  console.log(`[meta] captured cookies: ${cookieStr || "(none)"}`);
+  console.log(`[meta] captured cookie names: ${cookieNames(cookieStr)}`);
 
   const $ = cheerio.load(html);
   const title =
