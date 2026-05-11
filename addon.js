@@ -1840,7 +1840,7 @@ function buildExternalStreamObjects(externalPlayerUrls, pageUrl) {
 
     streams.push({
       name: "Archivebate 🔗",
-      title: "Open Mixdrop Player"
+      title: "Open Mixdrop Player",
 externalUrl: item.url
     });
   }
