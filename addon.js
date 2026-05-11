@@ -43,19 +43,20 @@ async function doFetch(url, opts = {}, useProxy = true) {
 
 // Archivebate category/tag slugs — update these to match the site's actual tag URLs
 const GENRE_TAG_SLUGS = {
-  "Amateur": "amateur",
-  "Asian": "asian",
-  "BBW": "bbw",
-  "Big Tits": "big-tits",
-  "Blonde": "blonde",
-  "Brunette": "brunette",
-  "Chaturbate": "chaturbate",
-  "Latina": "latina",
-  "Lesbian": "lesbian",
-  "MILF": "milf",
-  "OnlyFans": "onlyfans",
-  "Redhead": "redhead",
-  "Teen": "teen",
+  "YouTube": "eW91dHViZQ%3D%3D",
+  "Twitch": "dHdpdGNo",
+  "OnlyFans": "b25seWZhbnM%3D",
+  "Instagram": "aW5zdGFncmFt",
+  "TikTok": "dGlrdG9r",
+  "Bongacams": "Ym9uZ2FjYW1z",
+  "Cam4": "Y2FtNA%3D%3D",
+  "Camsoda": "Y2Ftc29kYQ%3D%3D",
+  "Chaturbate": "Y2hhdHVyYmF0ZQ%3D%3D",
+  "Stripchat": "c3RyaXBjaGF0",
+  "Female": "ZmVtYWxl",
+  "Couple": "Y291cGxl",
+  "Male": "bWFsZQ%3D%3D",
+  "Trans": "dHJhbnM%3D",
 };
 
 const manifest = {
@@ -482,11 +483,43 @@ function debugCatalogHtml(html, baseUrl) {
 
   console.log(`[debug] html length=${html.length}`);
   console.log(`[debug] total hrefs=${hrefs.length}`);
-  console.log(`[debug] watch hrefs=${watchHrefs.length}: ${watchHrefs.slice(0, 10).join(", ") || "(none)"}`);
-  console.log(`[debug] script srcs=${scripts.length}: ${scripts.slice(0, 10).join(", ") || "(none)"}`);
+  console.log(`[debug] hrefs=${hrefs.slice(0, 80).join(" | ") || "(none)"}`);
+  console.log(`[debug] watch hrefs=${watchHrefs.length}: ${watchHrefs.slice(0, 20).join(", ") || "(none)"}`);
+  console.log(`[debug] script srcs=${scripts.length}: ${scripts.slice(0, 20).join(", ") || "(none)"}`);
 
-  const apiLike = html.match(/["'`](\/[^"'`]*(?:api|video|watch|recent|search)[^"'`]*)["'`]/gi) || [];
-  console.log(`[debug] api-like strings=${apiLike.length}: ${apiLike.slice(0, 20).join(" | ") || "(none)"}`);
+  const markers = [
+    "wire:id",
+    "wire:initial-data",
+    "livewire",
+    "Livewire",
+    "Recent Videos",
+    "Loading...",
+    "/watch/",
+    "platform/",
+    "archivebate.min.js",
+  ];
+
+  for (const marker of markers) {
+    const idx = html.indexOf(marker);
+    console.log(`[debug] marker "${marker}" idx=${idx}`);
+    if (idx >= 0) {
+      const start = Math.max(0, idx - 600);
+      const end = Math.min(html.length, idx + 1200);
+      console.log(`[debug] snippet around "${marker}": ${html.slice(start, end).replace(/\s+/g, " ").substring(0, 1800)}`);
+    }
+  }
+
+  const livewireNodes = $("[wire\\:id], [wire\\:initial-data], [wire\\:snapshot], [wire\\:effects]");
+  console.log(`[debug] livewire nodes=${livewireNodes.length}`);
+
+  livewireNodes.each((i, el) => {
+    if (i >= 5) return;
+
+    const node = $(el);
+    console.log(`[debug] livewire node ${i} tag=${el.tagName || el.name || "unknown"}`);
+    console.log(`[debug] livewire node ${i} attrs=${JSON.stringify(el.attribs || {}).substring(0, 2000)}`);
+    console.log(`[debug] livewire node ${i} text=${cleanCatalogText(node.text()).substring(0, 500)}`);
+  });
 }
 
 async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
@@ -513,41 +546,31 @@ async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
   }
 
   if (genre && GENRE_TAG_SLUGS[genre]) {
-    const slug = GENRE_TAG_SLUGS[genre];
+  const encodedPlatform = GENRE_TAG_SLUGS[genre];
 
-    // Archivebate tag/category URLs — try common patterns
-    const tagUrls = page <= 1
-      ? [
-          `${BASE_URL}/tags/${slug}/`,
-          `${BASE_URL}/categories/${slug}/`,
-          `${BASE_URL}/tag/${slug}/`,
-          `${BASE_URL}/category/${slug}/`,
-        ]
-      : [
-          `${BASE_URL}/tags/${slug}/?page=${page}`,
-          `${BASE_URL}/categories/${slug}/?page=${page}`,
-          `${BASE_URL}/tag/${slug}/?page=${page}`,
-          `${BASE_URL}/category/${slug}/?page=${page}`,
-        ];
+  const platformUrl = page <= 1
+    ? `${BASE_URL}/platform/${encodedPlatform}`
+    : `${BASE_URL}/platform/${encodedPlatform}?page=${page}`;
 
-    for (const tagUrl of tagUrls) {
-      try {
-        console.log(`[catalog] fetching genre "${genre}" from ${tagUrl}`);
-        const html = await fetchHtml(tagUrl);
-        const metas = extractPostCards(html, tagUrl);
+  try {
+    console.log(`[catalog] fetching genre "${genre}" from ${platformUrl}`);
 
-        if (metas.length > 0) {
-          return metas;
-        }
+    const html = await fetchHtml(platformUrl);
+    debugCatalogHtml(html, platformUrl);
 
-        console.warn(`[catalog] genre "${genre}" returned no video metas from ${tagUrl}`);
-      } catch (err) {
-        console.warn(`[catalog] genre "${genre}" fetch failed: ${tagUrl} -> ${err.message}`);
-      }
+    const metas = extractPostCards(html, platformUrl);
+
+    if (metas.length > 0) {
+      return metas;
     }
 
+    console.warn(`[catalog] genre "${genre}" had no server-rendered watch links from ${platformUrl}`);
+    return [];
+  } catch (err) {
+    console.warn(`[catalog] genre "${genre}" fetch failed: ${platformUrl} -> ${err.message}`);
     return [];
   }
+}
 
   // Archivebate main catalog pagination: /?page=2, /?page=3, etc.
   const catalogUrl = page <= 1
