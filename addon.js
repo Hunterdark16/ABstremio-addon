@@ -32,6 +32,11 @@ const STREAM_CACHE_MS = 45 * 1000;
 const CATALOG_CACHE_MS = 30 * 60 * 1000;
 const META_CACHE_MS = 10 * 60 * 1000;
 
+const catalogTitleCache = new Map();
+const CATALOG_TITLE_CACHE_MS = 6 * 60 * 60 * 1000;
+const ENRICH_CATALOG_TITLES = process.env.ENRICH_CATALOG_TITLES !== "0";
+const MAX_TITLE_ENRICH_CONCURRENCY = Number(process.env.MAX_TITLE_ENRICH_CONCURRENCY || 4);
+
 // If /proxy is used manually, do not send video bytes through the outbound proxy.
 const SEGMENT_RE = /\.(ts|aac|m4s|woff2)(\?|$)/i;
 
@@ -378,13 +383,142 @@ async function fetchLivewireInitializedHtml(pageHtml, pageUrl, cookieStr = "") {
   return hydratedHtml;
 }
 
+function isFallbackArchivebateTitle(title) {
+  return /^Archivebate Video \d+$/i.test(cleanCatalogText(title));
+}
+
+function cleanArchivebatePageTitle(value, fallback = "") {
+  let title = cleanCatalogText(value);
+
+  title = title
+    .replace(/\s*[-|–]\s*Archivebate.*$/i, "")
+    .replace(/^Archivebate\s*[-|–]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!title || isBadCatalogTitle(title) || /^Archivebate$/i.test(title)) {
+    return fallback;
+  }
+
+  return title.substring(0, 180);
+}
+
+async function fetchTitleFromWatchPage(meta) {
+  if (!meta || !meta.website) return meta;
+  if (!isFallbackArchivebateTitle(meta.name)) return meta;
+
+  const cacheKey = meta.id || meta.website;
+  const cached = catalogTitleCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.updatedAt < CATALOG_TITLE_CACHE_MS) {
+    return {
+      ...meta,
+      name: cached.title || meta.name,
+      description: cached.description || meta.description,
+    };
+  }
+
+  try {
+    console.log(`[title] fetching ${meta.website}`);
+
+    const res = await doFetch(
+      meta.website,
+      {
+        headers: {
+          ...HEADERS,
+          Referer: BASE_URL + "/",
+        },
+      },
+      true
+    );
+
+    if (!res.ok) {
+      console.warn(`[title] HTTP ${res.status} for ${meta.website}`);
+      return meta;
+    }
+
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    const fallback = meta.name;
+
+    const title = cleanArchivebatePageTitle(
+      $("meta[property='og:title']").attr("content") ||
+      $("meta[name='twitter:title']").attr("content") ||
+      $("meta[name='title']").attr("content") ||
+      $("h1").first().text() ||
+      $("title").first().text(),
+      fallback
+    );
+
+    const description = cleanCatalogText(
+      $("meta[property='og:description']").attr("content") ||
+      $("meta[name='description']").attr("content") ||
+      meta.description ||
+      ""
+    ).substring(0, 240);
+
+    catalogTitleCache.set(cacheKey, {
+      title,
+      description,
+      updatedAt: Date.now(),
+    });
+
+    if (process.env.DEBUG_CATALOG_ITEMS === "1") {
+      console.log(`[title-debug] ${meta.id}: "${fallback}" -> "${title}"`);
+    }
+
+    return {
+      ...meta,
+      name: title || meta.name,
+      description: description || meta.description,
+    };
+  } catch (err) {
+    console.warn(`[title] failed for ${meta.website}: ${err.message}`);
+    return meta;
+  }
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const out = new Array(items.length);
+  let next = 0;
+
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(concurrency, items.length)) },
+    async () => {
+      while (next < items.length) {
+        const idx = next++;
+        out[idx] = await mapper(items[idx], idx);
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return out;
+}
+
+async function enrichCatalogTitles(metas) {
+  if (!ENRICH_CATALOG_TITLES) return metas;
+
+  const needsEnrich = metas.some(meta => isFallbackArchivebateTitle(meta.name));
+  if (!needsEnrich) return metas;
+
+  console.log(`[title] enriching fallback titles for ${metas.length} catalog items`);
+
+  return await mapWithConcurrency(
+    metas,
+    MAX_TITLE_ENRICH_CONCURRENCY,
+    fetchTitleFromWatchPage
+  );
+}
+
 async function fetchCatalogMetasFromLivewirePage(url) {
   const { html, cookieStr } = await fetchHtmlWithCookies(url);
 
   debugCatalogHtml(html, url);
 
   let metas = extractPostCards(html, url);
-  if (metas.length > 0) return metas;
+  if (metas.length > 0) return await enrichCatalogTitles(metas);
 
   console.log("[catalog] no static watch links; trying Livewire hydration");
 
@@ -395,7 +529,7 @@ async function fetchCatalogMetasFromLivewirePage(url) {
 
     console.log(`[catalog] Livewire extractPostCards found ${metas.length} video items`);
 
-    if (metas.length > 0) return metas;
+    if (metas.length > 0) return await enrichCatalogTitles(metas);
   }
 
   return [];
